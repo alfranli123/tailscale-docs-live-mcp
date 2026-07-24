@@ -10,7 +10,9 @@ Unofficial. Not affiliated with or endorsed by Tailscale Inc.
 
 - **Search** uses Tailscale's own public search endpoint (`tailscale.com/api/search`).
 - **Page content** is extracted from the server-rendered `<article>` HTML of each
-  docs page and converted to plain text with the Python stdlib (no BeautifulSoup).
+  docs page and converted to readable plain text/Markdown with the Python stdlib
+  (no BeautifulSoup). Tables become Markdown tables, links are preserved as
+  absolute Markdown links, and `<pre>` code whitespace is preserved.
 - **Inventory** comes from `sitemap.xml` (~600 docs pages).
 - Results are cached in memory for 10 minutes to keep traffic polite.
 - Only `tailscale.com` URLs are fetched; anything else is refused.
@@ -20,7 +22,7 @@ Unofficial. Not affiliated with or endorsed by Tailscale Inc.
 | Tool | Description |
 |---|---|
 | `search_docs(query, limit=5)` | Full-text search of the docs. Returns title, URL, description, score. |
-| `get_doc(url_or_path)` | Plain-text content of a docs page. Accepts a full URL, a `/docs/...` path, or a legacy `kb/NNNN/slug` path (follows the redirect). Content truncated at 12,000 chars. |
+| `get_doc(url_or_path, offset=0)` | Read a docs page. Accepts a full URL, a `/docs/...` path, or a legacy `kb/NNNN/slug` path (follows the redirect). The default response is limited to 12,000 chars; pass `offset` to page through longer content. |
 | `list_docs(prefix="", limit=50)` | Browse all docs pages from the sitemap, filtered by path substring (e.g. `exit-nodes`, `reference/`). |
 
 ## Install
@@ -53,9 +55,9 @@ Any MCP client that supports stdio servers works. Generic shape:
 
 - Error conditions return `{"error": ..., "status": ...}` dicts; the server
   never crashes on bad input.
-- Long pages (e.g. the CLI reference) are truncated at 12,000 characters with
-  a notice; use `search_docs` to find the specific page covering your topic
-  instead of reading one giant page.
+- Long pages (e.g. the CLI reference) return the first 12,000 characters with
+  a notice and report continuation guidance; pass the suggested `offset` to
+  retrieve the next slice from the cached full conversion.
 - Search descriptions have Tailscale's `<mark>`/`<em>` highlight tags stripped.
 
 ## License

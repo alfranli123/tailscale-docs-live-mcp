@@ -12,7 +12,7 @@ import time
 import html as html_mod
 from html.parser import HTMLParser
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -107,6 +107,9 @@ class _HTMLToText(HTMLParser):
         super().__init__()
         self._output: list[str] = []
         self._skip = 0  # nesting depth of <script>/<style>
+        self._pre_depth = 0
+        self._links: list[dict[str, Any]] = []
+        self._tables: list[dict[str, Any]] = []
 
     def _emit(self, text: str) -> None:
         if self._skip > 0:
@@ -116,6 +119,34 @@ class _HTMLToText(HTMLParser):
     def _maybe_newline(self) -> None:
         if self._output and not self._output[-1].endswith("\n"):
             self._emit("\n")
+
+    def _current_table(self) -> dict[str, Any] | None:
+        return self._tables[-1] if self._tables else None
+
+    def _start_table_row(self, table: dict[str, Any]) -> None:
+        if table["row_active"]:
+            self._end_table_row(table)
+        self._maybe_newline()
+        self._emit("| ")
+        table["row_active"] = True
+        table["cell_count"] = 0
+        table["row_is_header"] = table["thead_depth"] > 0 or table["rows_seen"] == 0
+        table["in_cell"] = False
+        table["cell_tag"] = None
+
+    def _end_table_row(self, table: dict[str, Any]) -> None:
+        if not table["row_active"]:
+            return
+        cell_count = max(1, table["cell_count"])
+        self._emit(" |\n")
+        if table["row_is_header"] and not table["header_separator_emitted"]:
+            self._emit("|" + "---|" * cell_count + "\n")
+            table["header_separator_emitted"] = True
+        table["rows_seen"] += 1
+        table["row_active"] = False
+        table["cell_count"] = 0
+        table["in_cell"] = False
+        table["cell_tag"] = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag_low = tag.lower()
@@ -139,18 +170,62 @@ class _HTMLToText(HTMLParser):
         elif tag_low == "li":
             self._maybe_newline()
             self._emit("  - ")
-        elif tag_low in ("th", "td"):
-            pass
-        elif tag_low == "tr":
+        elif tag_low == "a":
+            href = next((value for name, value in attrs if name.lower() == "href"), None)
+            href = href.strip() if href else ""
+            if not href or href.startswith("#") or href.lower().startswith("javascript:"):
+                href = ""
+            elif not urlparse(href).scheme and not href.startswith("//"):
+                href = urljoin(f"{DOCS_BASE}/", href)
+            elif href.startswith("//"):
+                href = urljoin(f"{DOCS_BASE}/", href)
+            if self._links:
+                self._links[-1]["nested"] = True
+            self._links.append({"href": href, "start": len(self._output), "nested": False})
+        elif tag_low == "table":
             self._maybe_newline()
+            self._tables.append(
+                {
+                    "rows_seen": 0,
+                    "row_active": False,
+                    "cell_count": 0,
+                    "row_is_header": False,
+                    "header_separator_emitted": False,
+                    "thead_depth": 0,
+                    "in_cell": False,
+                    "cell_tag": None,
+                }
+            )
+        elif tag_low == "thead":
+            table = self._current_table()
+            if table is not None:
+                table["thead_depth"] += 1
+        elif tag_low == "tr":
+            table = self._current_table()
+            if table is not None:
+                self._start_table_row(table)
+            else:
+                self._maybe_newline()
+        elif tag_low in ("th", "td"):
+            table = self._current_table()
+            if table is not None:
+                if not table["row_active"]:
+                    self._start_table_row(table)
+                if table["cell_count"] > 0:
+                    self._emit(" | ")
+                table["cell_count"] += 1
+                table["in_cell"] = True
+                table["cell_tag"] = tag_low
         elif tag_low in ("ol", "ul"):
             self._maybe_newline()
         elif tag_low == "blockquote":
             self._maybe_newline()
             self._emit("\n> ")
         elif tag_low == "code":
-            self._emit("`")
+            if self._pre_depth == 0:
+                self._emit("`")
         elif tag_low == "pre":
+            self._pre_depth += 1
             self._maybe_newline()
             self._emit("\n```\n")
 
@@ -161,26 +236,64 @@ class _HTMLToText(HTMLParser):
             return
         if self._skip > 0:
             return
+        if tag_low == "a":
+            if not self._links:
+                return
+            link = self._links.pop()
+            href = link["href"]
+            if not href or link["nested"]:
+                return
+            text = "".join(self._output[link["start"]:])
+            if not text.strip():
+                return
+            self._output[link["start"]:] = [f"[{text}]({href})"]
+            return
         if tag_low == "li":
             self._emit("\n")
         elif tag_low == "p":
             self._emit("\n")
         elif tag_low in ("th", "td"):
-            self._emit("  ")
+            table = self._current_table()
+            if table is not None and table["cell_tag"] == tag_low:
+                table["in_cell"] = False
+                table["cell_tag"] = None
         elif tag_low == "tr":
-            self._emit("\n")
+            table = self._current_table()
+            if table is not None:
+                self._end_table_row(table)
+            else:
+                self._emit("\n")
+        elif tag_low == "thead":
+            table = self._current_table()
+            if table is not None:
+                table["thead_depth"] = max(0, table["thead_depth"] - 1)
+        elif tag_low == "table":
+            table = self._current_table()
+            if table is not None:
+                self._end_table_row(table)
+                self._tables.pop()
+                self._maybe_newline()
         elif tag_low == "blockquote":
             self._emit("\n")
         elif tag_low == "pre":
-            self._emit("\n```\n")
+            if self._pre_depth > 0:
+                self._emit("\n```\n")
+                self._pre_depth -= 1
         elif tag_low == "code":
-            self._emit("`")
+            if self._pre_depth == 0:
+                self._emit("`")
 
     def handle_data(self, data: str) -> None:
         if self._skip > 0:
             return
-        text = re.sub(r"\s+", " ", data).strip()
+        if self._pre_depth > 0:
+            text = data
+        else:
+            text = re.sub(r"\s+", " ", data).strip()
         if text:
+            table = self._current_table()
+            if table is not None and table["row_active"] and table["in_cell"]:
+                text = text.replace("|", r"\|")
             self._emit(text)
 
     def handle_entityref(self, name: str) -> None:
@@ -320,7 +433,7 @@ async def search_docs(query: str, limit: int = 5) -> list[dict[str, Any]]:
 
 
 @mcp.tool()
-async def get_doc(url_or_path: str) -> dict[str, Any]:
+async def get_doc(url_or_path: str, offset: int = 0) -> dict[str, Any]:
     """Fetch the full plain-text content of a Tailscale docs page.
 
     Accepts:
@@ -328,84 +441,104 @@ async def get_doc(url_or_path: str) -> dict[str, Any]:
       - A /docs/... path: /docs/features/exit-nodes
       - A kb/NNNN/slug path: kb/1080/cli  (auto-redirected to /docs/...)
 
+    Args:
+        url_or_path: Full Tailscale URL or documentation path.
+        offset: Optional character offset for retrieving a continuation page.
+
     Returns dict with url, title, content. Returns error dict on 404 or failure.
-    Content is truncated at 12,000 characters with a notice.
+    The default page is limited to 12,000 characters; use offset for continuation.
     """
     url = _normalise_doc_url(url_or_path)
     if not url:
         return {"error": "Only tailscale.com URLs are supported", "input": url_or_path}
 
     cache_key = f"doc:{url}"
-    cached = _cached(cache_key)
-    if cached is not None:
-        return cached
+    cached_article = _cached(cache_key)
+    if cached_article is None:
+        result = await _http_get(url)
+        if "error" in result:
+            return result
 
-    result = await _http_get(url)
-    if "error" in result:
-        return result
+        html = result.get("_html", "")
+        if not html:
+            return {"error": "Empty response", "url": url}
 
-    html = result.get("_html", "")
-    if not html:
-        return {"error": "Empty response", "url": url}
+        # Extract title
+        title = _extract_title_from_html(html)
 
-    # Extract title
-    title = _extract_title_from_html(html)
-
-    # Extract <article> block (the main docs content)
-    article_match = re.search(
-        r'<article[^>]*>(.*?)</article>', html, re.DOTALL | re.IGNORECASE
-    )
-    if article_match:
-        body_html = article_match.group(1)
-    else:
-        # Fallback: try <main> or just use the whole body
-        main_match = re.search(
-            r'<main[^>]*>(.*?)</main>', html, re.DOTALL | re.IGNORECASE
+        # Extract <article> block (the main docs content)
+        article_match = re.search(
+            r'<article[^>]*>(.*?)</article>', html, re.DOTALL | re.IGNORECASE
         )
-        if main_match:
-            body_html = main_match.group(1)
+        if article_match:
+            body_html = article_match.group(1)
         else:
-            # Use everything inside <body>
-            body_match = re.search(
-                r'<body[^>]*>(.*?)</body>', html, re.DOTALL | re.IGNORECASE
+            # Fallback: try <main> or just use the whole body
+            main_match = re.search(
+                r'<main[^>]*>(.*?)</main>', html, re.DOTALL | re.IGNORECASE
             )
-            body_html = body_match.group(1) if body_match else html
+            if main_match:
+                body_html = main_match.group(1)
+            else:
+                # Use everything inside <body>
+                body_match = re.search(
+                    r'<body[^>]*>(.*?)</body>', html, re.DOTALL | re.IGNORECASE
+                )
+                body_html = body_match.group(1) if body_match else html
 
-    # Strip <script> and <style> blocks before HTML-to-text conversion
-    body_html = re.sub(
-        r'<script[^>]*>.*?</script>', "", body_html, flags=re.DOTALL | re.IGNORECASE
-    )
-    body_html = re.sub(
-        r'<style[^>]*>.*?</style>', "", body_html, flags=re.DOTALL | re.IGNORECASE
-    )
-    # Also strip SVG tags
-    body_html = re.sub(
-        r'<svg[^>]*>.*?</svg>', "", body_html, flags=re.DOTALL | re.IGNORECASE
-    )
-    # Strip nav tags too
-    body_html = re.sub(
-        r'<nav[^>]*>.*?</nav>', "", body_html, flags=re.DOTALL | re.IGNORECASE
-    )
+        # Strip <script> and <style> blocks before HTML-to-text conversion
+        body_html = re.sub(
+            r'<script[^>]*>.*?</script>', "", body_html, flags=re.DOTALL | re.IGNORECASE
+        )
+        body_html = re.sub(
+            r'<style[^>]*>.*?</style>', "", body_html, flags=re.DOTALL | re.IGNORECASE
+        )
+        # Also strip SVG tags
+        body_html = re.sub(
+            r'<svg[^>]*>.*?</svg>', "", body_html, flags=re.DOTALL | re.IGNORECASE
+        )
+        # Strip nav tags too
+        body_html = re.sub(
+            r'<nav[^>]*>.*?</nav>', "", body_html, flags=re.DOTALL | re.IGNORECASE
+        )
 
-    content = html_to_text(body_html)
+        cached_article = {
+            "url": url,
+            "title": title,
+            "content": html_to_text(body_html),
+        }
+        _set_cache(cache_key, cached_article)
 
-    truncated = False
-    if len(content) > MAX_CONTENT_CHARS:
-        content = (
-            content[:MAX_CONTENT_CHARS]
+    full_content = cached_article["content"]
+    result_out: dict[str, Any] = {
+        "url": cached_article["url"],
+        "title": cached_article["title"],
+        "content": full_content,
+    }
+
+    if offset > 0:
+        start = max(0, offset)
+        page_content = full_content[start : start + MAX_CONTENT_CHARS]
+        remaining = max(0, len(full_content) - start - len(page_content))
+        result_out["content"] = page_content
+        result_out["offset"] = start
+        result_out["remaining_chars"] = remaining
+        next_offset = start + len(page_content)
+        result_out["continuation_note"] = (
+            f"{remaining} characters remain; call get_doc(url_or_path={url_or_path!r}, "
+            f"offset={next_offset}) for the next page."
+            if remaining
+            else "0 characters remain."
+        )
+        return result_out
+
+    if len(full_content) > MAX_CONTENT_CHARS:
+        result_out["content"] = (
+            full_content[:MAX_CONTENT_CHARS]
             + f"\n\n[... content truncated at {MAX_CONTENT_CHARS:,} characters ...]"
         )
-        truncated = True
-
-    result_out: dict[str, Any] = {
-        "url": url,
-        "title": title,
-        "content": content,
-    }
-    if truncated:
         result_out["truncated"] = True
 
-    _set_cache(cache_key, result_out)
     return result_out
 
 
