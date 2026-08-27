@@ -4,7 +4,7 @@ MCP server that provides live access to Tailscale documentation
 (tailscale.com/docs) via the public search API, page HTML extraction,
 and sitemap inventory.
 
-Tools: search_docs, get_doc, list_docs
+Tools: search_docs, get_doc, get_doc_outline, list_docs
 """
 
 import asyncio
@@ -25,7 +25,7 @@ from mcp.server.fastmcp import FastMCP
 SEARCH_URL = "https://tailscale.com/api/search"
 SITEMAP_URL = "https://tailscale.com/sitemap.xml"
 DOCS_BASE = "https://tailscale.com"
-USER_AGENT = "tailscale-docs-live-mcp/0.2 (+https://github.com/alfranli123/tailscale-docs-live-mcp)"
+USER_AGENT = "tailscale-docs-live-mcp/0.3 (+https://github.com/alfranli123/tailscale-docs-live-mcp)"
 REQUEST_TIMEOUT = 20  # seconds
 CACHE_TTL = 600  # seconds (10 min)
 CACHE_MAX_ENTRIES = 200
@@ -40,8 +40,9 @@ mcp = FastMCP(
     "tailscale-docs-live",
     instructions=(
         "Live Tailscale documentation via public search API and page extraction. "
-        "Use search_docs to find docs, get_doc to read article content, "
-        "and list_docs to browse the sitemap."
+        "Suggested workflow: search_docs to find pages, get_doc_outline to skim "
+        "structure, get_doc (with offset when truncated) to read content, and "
+        "list_docs to browse the sitemap by prefix."
     ),
 )
 
@@ -419,6 +420,206 @@ def html_to_text(html: str) -> str:
     return parser.get_text()
 
 
+class _HeadingExtractor(HTMLParser):
+    """Extract heading structure (level, text, id) from HTML."""
+
+    def __init__(self, max_level: int = 3) -> None:
+        super().__init__()
+        self._max_level = max_level
+        self._skip = 0
+        self._in_heading: int | None = None
+        self._heading_id = ""
+        self._heading_parts: list[str] = []
+        self.headings: list[dict[str, Any]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag_low = tag.lower()
+        if tag_low in ("script", "style"):
+            self._skip += 1
+            return
+        if self._skip > 0:
+            return
+        if tag_low in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            level = int(tag_low[1])
+            if level <= self._max_level:
+                self._in_heading = level
+                self._heading_id = next(
+                    (value for name, value in attrs if name.lower() == "id"),
+                    "",
+                ) or ""
+                self._heading_parts = []
+
+    def handle_endtag(self, tag: str) -> None:
+        tag_low = tag.lower()
+        if tag_low in ("script", "style"):
+            self._skip = max(0, self._skip - 1)
+            return
+        if self._skip > 0:
+            return
+        if self._in_heading is not None and tag_low == f"h{self._in_heading}":
+            text = html_mod.unescape("".join(self._heading_parts))
+            text = re.sub(r"\s+", " ", text).strip()
+            if text:
+                anchor_id = self._heading_id or _slugify_heading(text)
+                self.headings.append(
+                    {
+                        "level": self._in_heading,
+                        "text": text,
+                        "id": anchor_id,
+                        "anchor": f"#{anchor_id}",
+                    }
+                )
+            self._in_heading = None
+            self._heading_id = ""
+            self._heading_parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self._skip > 0 or self._in_heading is None:
+            return
+        self._heading_parts.append(data)
+
+
+def _slugify_heading(text: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return slug or "section"
+
+
+def extract_outline(html: str, max_level: int = 3) -> list[dict[str, Any]]:
+    """Return heading outline from HTML."""
+    parser = _HeadingExtractor(max_level=max_level)
+    try:
+        parser.feed(html)
+        parser.close()
+    except Exception:
+        pass
+    return parser.headings
+
+
+def _extract_body_html(html: str) -> str:
+    """Extract and sanitize the main article HTML from a docs page."""
+    article_match = re.search(
+        r'<article[^>]*>(.*?)</article>', html, re.DOTALL | re.IGNORECASE
+    )
+    if article_match:
+        body_html = article_match.group(1)
+    else:
+        main_match = re.search(
+            r'<main[^>]*>(.*?)</main>', html, re.DOTALL | re.IGNORECASE
+        )
+        if main_match:
+            body_html = main_match.group(1)
+        else:
+            body_match = re.search(
+                r'<body[^>]*>(.*?)</body>', html, re.DOTALL | re.IGNORECASE
+            )
+            body_html = body_match.group(1) if body_match else html
+
+    for pattern in (
+        r'<script[^>]*>.*?</script>',
+        r'<style[^>]*>.*?</style>',
+        r'<svg[^>]*>.*?</svg>',
+        r'<nav[^>]*>.*?</nav>',
+    ):
+        body_html = re.sub(pattern, "", body_html, flags=re.DOTALL | re.IGNORECASE)
+    return body_html
+
+
+async def _load_doc(url_or_path: str) -> dict[str, Any]:
+    """Fetch, parse, and cache a docs page. Returns an error dict on failure."""
+    url = _normalise_doc_url(url_or_path)
+    if not url:
+        return {"error": "Only tailscale.com URLs are supported", "input": url_or_path}
+
+    cache_key = f"doc:{url}"
+    cached_article = _cached(cache_key)
+    if cached_article is not None:
+        return cached_article
+
+    result = await _http_get(url)
+    if "error" in result:
+        return result
+
+    html = result.get("_html", "")
+    if not html:
+        return {"error": "Empty response", "url": url}
+
+    body_html = _extract_body_html(html)
+    cached_article = {
+        "url": url,
+        "title": _extract_title_from_html(html),
+        "content": html_to_text(body_html),
+        "outline": extract_outline(body_html),
+    }
+    _set_cache(cache_key, cached_article)
+    return cached_article
+
+
+def _paginate_doc_content(
+    article: dict[str, Any],
+    url_or_path: str,
+    offset: int,
+) -> dict[str, Any]:
+    """Apply character paging to a loaded doc article."""
+    full_content = article["content"]
+    result_out: dict[str, Any] = {
+        "url": article["url"],
+        "title": article["title"],
+        "content": full_content,
+        "total_chars": len(full_content),
+    }
+
+    if offset > 0:
+        start = max(0, offset)
+        page_content = full_content[start : start + MAX_CONTENT_CHARS]
+        remaining = max(0, len(full_content) - start - len(page_content))
+        next_offset = start + len(page_content)
+        result_out["content"] = page_content
+        result_out["offset"] = start
+        result_out["remaining_chars"] = remaining
+        result_out["next_offset"] = next_offset if remaining else None
+        result_out["continuation_note"] = (
+            f"{remaining} characters remain; call get_doc(url_or_path={url_or_path!r}, "
+            f"offset={next_offset}) for the next page."
+            if remaining
+            else "0 characters remain."
+        )
+        return result_out
+
+    if len(full_content) > MAX_CONTENT_CHARS:
+        remaining = len(full_content) - MAX_CONTENT_CHARS
+        result_out["content"] = (
+            full_content[:MAX_CONTENT_CHARS]
+            + f"\n\n[... content truncated at {MAX_CONTENT_CHARS:,} characters ...]"
+        )
+        result_out["truncated"] = True
+        result_out["remaining_chars"] = remaining
+        result_out["next_offset"] = MAX_CONTENT_CHARS
+        result_out["continuation_note"] = (
+            f"{remaining} characters remain; call get_doc(url_or_path={url_or_path!r}, "
+            f"offset={MAX_CONTENT_CHARS}) for the next page."
+        )
+
+    return result_out
+
+
+def _normalise_list_prefix(prefix: str) -> str:
+    """Normalise a list_docs prefix to a /docs/... path when using path_prefix."""
+    normalized = prefix.strip()
+    if not normalized.startswith("/"):
+        normalized = f"/{normalized}"
+    if not normalized.startswith("/docs"):
+        normalized = f"/docs{normalized}"
+    return normalized
+
+
+def _doc_path_matches(path: str, prefix: str, path_prefix: bool) -> bool:
+    if not prefix:
+        return True
+    if path_prefix:
+        return path.lower().startswith(_normalise_list_prefix(prefix).lower())
+    return prefix.lower() in path.lower()
+
+
 def _normalise_doc_url(url_or_path: str) -> str:
     """Accept full URL, /docs/... path, or kb/NNNN/slug -> absolute docs URL."""
     stripped = url_or_path.strip()
@@ -529,121 +730,73 @@ async def get_doc(url_or_path: str, offset: int = 0) -> dict[str, Any]:
         url_or_path: Full Tailscale URL or documentation path.
         offset: Optional character offset for retrieving a continuation page.
 
-    Returns dict with url, title, content. Returns error dict on 404 or failure.
-    The default page is limited to 12,000 characters; use offset for continuation.
+    Returns dict with url, title, content, and paging metadata. Long pages are
+    limited to 12,000 characters; use next_offset (or offset) for continuation.
     """
-    url = _normalise_doc_url(url_or_path)
-    if not url:
-        return {"error": "Only tailscale.com URLs are supported", "input": url_or_path}
-
-    cache_key = f"doc:{url}"
-    cached_article = _cached(cache_key)
-    if cached_article is None:
-        result = await _http_get(url)
-        if "error" in result:
-            return result
-
-        html = result.get("_html", "")
-        if not html:
-            return {"error": "Empty response", "url": url}
-
-        # Extract title
-        title = _extract_title_from_html(html)
-
-        # Extract <article> block (the main docs content)
-        article_match = re.search(
-            r'<article[^>]*>(.*?)</article>', html, re.DOTALL | re.IGNORECASE
-        )
-        if article_match:
-            body_html = article_match.group(1)
-        else:
-            # Fallback: try <main> or just use the whole body
-            main_match = re.search(
-                r'<main[^>]*>(.*?)</main>', html, re.DOTALL | re.IGNORECASE
-            )
-            if main_match:
-                body_html = main_match.group(1)
-            else:
-                # Use everything inside <body>
-                body_match = re.search(
-                    r'<body[^>]*>(.*?)</body>', html, re.DOTALL | re.IGNORECASE
-                )
-                body_html = body_match.group(1) if body_match else html
-
-        # Strip <script> and <style> blocks before HTML-to-text conversion
-        body_html = re.sub(
-            r'<script[^>]*>.*?</script>', "", body_html, flags=re.DOTALL | re.IGNORECASE
-        )
-        body_html = re.sub(
-            r'<style[^>]*>.*?</style>', "", body_html, flags=re.DOTALL | re.IGNORECASE
-        )
-        # Also strip SVG tags
-        body_html = re.sub(
-            r'<svg[^>]*>.*?</svg>', "", body_html, flags=re.DOTALL | re.IGNORECASE
-        )
-        # Strip nav tags too
-        body_html = re.sub(
-            r'<nav[^>]*>.*?</nav>', "", body_html, flags=re.DOTALL | re.IGNORECASE
-        )
-
-        cached_article = {
-            "url": url,
-            "title": title,
-            "content": html_to_text(body_html),
-        }
-        _set_cache(cache_key, cached_article)
-
-    full_content = cached_article["content"]
-    result_out: dict[str, Any] = {
-        "url": cached_article["url"],
-        "title": cached_article["title"],
-        "content": full_content,
-    }
-
-    if offset > 0:
-        start = max(0, offset)
-        page_content = full_content[start : start + MAX_CONTENT_CHARS]
-        remaining = max(0, len(full_content) - start - len(page_content))
-        result_out["content"] = page_content
-        result_out["offset"] = start
-        result_out["remaining_chars"] = remaining
-        next_offset = start + len(page_content)
-        result_out["continuation_note"] = (
-            f"{remaining} characters remain; call get_doc(url_or_path={url_or_path!r}, "
-            f"offset={next_offset}) for the next page."
-            if remaining
-            else "0 characters remain."
-        )
-        return result_out
-
-    if len(full_content) > MAX_CONTENT_CHARS:
-        result_out["content"] = (
-            full_content[:MAX_CONTENT_CHARS]
-            + f"\n\n[... content truncated at {MAX_CONTENT_CHARS:,} characters ...]"
-        )
-        result_out["truncated"] = True
-
-    return result_out
+    article = await _load_doc(url_or_path)
+    if "error" in article:
+        return article
+    return _paginate_doc_content(article, url_or_path, offset)
 
 
 @mcp.tool()
-async def list_docs(prefix: str = "", limit: int = 50) -> list[dict[str, str]]:
+async def get_doc_outline(url_or_path: str, max_level: int = 3) -> dict[str, Any]:
+    """Return the heading outline for a Tailscale docs page.
+
+    Useful for skimming long pages before calling get_doc. Headings include
+    level (1-3 by default), text, id, and anchor (#fragment).
+
+    Args:
+        url_or_path: Full Tailscale URL or documentation path.
+        max_level: Include headings up to this level (default 3).
+    """
+    article = await _load_doc(url_or_path)
+    if "error" in article:
+        return article
+
+    max_level = max(1, min(6, max_level))
+    headings = [h for h in article["outline"] if h["level"] <= max_level]
+    return {
+        "url": article["url"],
+        "title": article["title"],
+        "headings": headings,
+    }
+
+
+@mcp.tool()
+async def list_docs(
+    prefix: str = "",
+    limit: int = 50,
+    path_prefix: bool = False,
+) -> dict[str, Any]:
     """List available Tailscale documentation pages from the sitemap.
 
     Args:
-        prefix: Filter by substring in the doc path (e.g. "exit-nodes",
-                "reference/", "install/"). Empty string returns all docs.
+        prefix: Filter docs paths. By default matches any substring in the path.
+                When path_prefix is true, only paths starting with this prefix
+                match (e.g. "reference/" or "/docs/reference/").
         limit: Max entries to return (default 50).
+        path_prefix: When true, treat prefix as a path prefix instead of substring.
     """
     urls = await _fetch_sitemap()
     if not urls:
-        return []
+        return {"total": 0, "returned": 0, "has_more": False, "items": []}
 
     if prefix:
-        urls = [u for u in urls if prefix.lower() in u["path"].lower()]
+        urls = [
+            u
+            for u in urls
+            if _doc_path_matches(u["path"], prefix, path_prefix)
+        ]
 
-    out = [{"path": u["path"], "url": u["url"]} for u in urls[:limit]]
-    return out
+    total = len(urls)
+    items = [{"path": u["path"], "url": u["url"]} for u in urls[:limit]]
+    return {
+        "total": total,
+        "returned": len(items),
+        "has_more": total > len(items),
+        "items": items,
+    }
 
 
 # ── Entrypoint ───────────────────────────────────────────────────────────────

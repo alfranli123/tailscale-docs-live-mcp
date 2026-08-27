@@ -38,6 +38,14 @@ async def main() -> int:
             print("search_docs count:", len(search_payload))
             print("search_docs first title:", search_payload[0]["title"])
 
+            outline_result = await session.call_tool(
+                "get_doc_outline",
+                arguments={"url_or_path": "/docs/features/exit-nodes", "max_level": 3},
+            )
+            outline_payload = _parse_tool_blocks(outline_result)[0]
+            print("get_doc_outline headings:", len(outline_payload.get("headings", [])))
+            print("get_doc_outline first:", outline_payload.get("headings", [{}])[0].get("text"))
+
             doc_result = await session.call_tool(
                 "get_doc",
                 arguments={"url_or_path": "/docs/features/exit-nodes"},
@@ -45,19 +53,26 @@ async def main() -> int:
             doc_payload = _parse_tool_blocks(doc_result)[0]
             print("get_doc title:", doc_payload["title"])
             print("get_doc content chars:", len(doc_payload.get("content", "")))
+            print("get_doc next_offset:", doc_payload.get("next_offset"))
 
             list_result = await session.call_tool(
                 "list_docs",
                 arguments={"prefix": "exit-nodes", "limit": 3},
             )
-            list_payload = _parse_tool_blocks(list_result)
-            print("list_docs count:", len(list_payload))
+            list_payload = _parse_tool_blocks(list_result)[0]
+            print("list_docs total:", list_payload.get("total"))
+            print("list_docs returned:", list_payload.get("returned"))
 
-    expected_tools = {"get_doc", "list_docs", "search_docs"}
+    expected_tools = {"get_doc", "get_doc_outline", "list_docs", "search_docs"}
     if set(tool_names) != expected_tools:
         print("unexpected tools:", set(tool_names) ^ expected_tools, file=sys.stderr)
         return 1
-    if not search_payload or not doc_payload.get("content") or not list_payload:
+    if (
+        not search_payload
+        or not outline_payload.get("headings")
+        or not doc_payload.get("content")
+        or not list_payload.get("items")
+    ):
         print("tool calls returned empty payloads", file=sys.stderr)
         return 1
     return 0

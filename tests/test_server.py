@@ -6,9 +6,13 @@ import pytest
 import server
 from server import (
     _TTLCache,
+    _doc_path_matches,
     _http_get,
     _normalise_doc_url,
+    _normalise_list_prefix,
+    extract_outline,
     get_doc,
+    get_doc_outline,
     html_to_text,
     list_docs,
     search_docs,
@@ -66,6 +70,40 @@ class TestHtmlToText:
         assert "| Plan | Exit nodes |" in text
         assert "---|" in text
         assert "| Free | Yes |" in text
+
+
+class TestExtractOutline:
+    def test_extracts_heading_levels_and_ids(self):
+        html = """
+        <h1>Overview</h1>
+        <h2 id="setup">Setup</h2>
+        <h3 id="linux">Linux</h3>
+        <h4 id="ignored">Too deep</h4>
+        """
+        outline = extract_outline(html, max_level=3)
+        assert outline == [
+            {"level": 1, "text": "Overview", "id": "overview", "anchor": "#overview"},
+            {"level": 2, "text": "Setup", "id": "setup", "anchor": "#setup"},
+            {"level": 3, "text": "Linux", "id": "linux", "anchor": "#linux"},
+        ]
+
+
+class TestListDocsFiltering:
+    def test_path_prefix_normalisation(self):
+        assert _normalise_list_prefix("reference/") == "/docs/reference/"
+        assert _normalise_list_prefix("/docs/install/") == "/docs/install/"
+
+    @pytest.mark.parametrize(
+        ("path", "prefix", "path_prefix", "expected"),
+        [
+            ("/docs/reference/cli", "reference/", True, True),
+            ("/docs/features/exit-nodes", "reference/", True, False),
+            ("/docs/features/exit-nodes", "exit-nodes", False, True),
+            ("/docs/install/linux", "exit-nodes", False, False),
+        ],
+    )
+    def test_doc_path_matches(self, path, prefix, path_prefix, expected):
+        assert _doc_path_matches(path, prefix, path_prefix) is expected
 
 
 class TestNormaliseDocUrl:
@@ -191,21 +229,84 @@ class TestTools:
         assert "## Exit nodes" in result["content"]
         assert "Route all traffic through a device." in result["content"]
 
-    async def test_list_docs_filters_by_prefix(self, httpx_mock):
+    async def test_get_doc_includes_next_offset_when_truncated(self, httpx_mock):
+        long_body = "x" * 15000
+        httpx_mock.add_response(
+            text=f"""
+            <html>
+              <head><title>Long page · Tailscale Docs</title></head>
+              <body><article><p>{long_body}</p></article></body>
+            </html>
+            """
+        )
+
+        result = await get_doc("/docs/features/long-page")
+
+        assert result["truncated"] is True
+        assert result["next_offset"] == server.MAX_CONTENT_CHARS
+        assert result["remaining_chars"] == 15000 - server.MAX_CONTENT_CHARS
+
+    async def test_get_doc_outline_returns_headings(self, httpx_mock):
+        httpx_mock.add_response(
+            text="""
+            <html>
+              <head><title>Exit nodes · Tailscale Docs</title></head>
+              <body>
+                <article>
+                  <h1>Exit nodes</h1>
+                  <h2 id="benefits">Benefits</h2>
+                  <h3 id="setup">Setup</h3>
+                </article>
+              </body>
+            </html>
+            """
+        )
+
+        result = await get_doc_outline("/docs/features/exit-nodes")
+
+        assert result["title"] == "Exit nodes · Tailscale Docs"
+        assert result["headings"] == [
+            {"level": 1, "text": "Exit nodes", "id": "exit-nodes", "anchor": "#exit-nodes"},
+            {"level": 2, "text": "Benefits", "id": "benefits", "anchor": "#benefits"},
+            {"level": 3, "text": "Setup", "id": "setup", "anchor": "#setup"},
+        ]
+
+    async def test_list_docs_returns_metadata(self, httpx_mock):
         httpx_mock.add_response(
             text="""
             <urlset>
               <url><loc>https://tailscale.com/docs/features/exit-nodes</loc></url>
+              <url><loc>https://tailscale.com/docs/features/exit-nodes/setup</loc></url>
               <url><loc>https://tailscale.com/docs/install/linux</loc></url>
             </urlset>
             """
         )
 
-        results = await list_docs(prefix="exit-nodes", limit=10)
+        results = await list_docs(prefix="exit-nodes", limit=1)
 
-        assert results == [
-            {
-                "path": "/docs/features/exit-nodes",
-                "url": "https://tailscale.com/docs/features/exit-nodes",
-            }
-        ]
+        assert results == {
+            "total": 2,
+            "returned": 1,
+            "has_more": True,
+            "items": [
+                {
+                    "path": "/docs/features/exit-nodes",
+                    "url": "https://tailscale.com/docs/features/exit-nodes",
+                }
+            ],
+        }
+
+    async def test_list_docs_path_prefix_filter(self, httpx_mock):
+        httpx_mock.add_response(
+            text="""
+            <urlset>
+              <url><loc>https://tailscale.com/docs/reference/cli</loc></url>
+              <url><loc>https://tailscale.com/docs/features/exit-nodes</loc></url>
+            </urlset>
+            """
+        )
+
+        results = await list_docs(prefix="reference/", limit=10, path_prefix=True)
+
+        assert results["total"] == 1
+        assert results["items"][0]["path"] == "/docs/reference/cli"
