@@ -7,9 +7,12 @@ and sitemap inventory.
 Tools: search_docs, get_doc, list_docs
 """
 
+import asyncio
+import atexit
 import re
 import time
 import html as html_mod
+from collections import OrderedDict
 from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -22,9 +25,13 @@ from mcp.server.fastmcp import FastMCP
 SEARCH_URL = "https://tailscale.com/api/search"
 SITEMAP_URL = "https://tailscale.com/sitemap.xml"
 DOCS_BASE = "https://tailscale.com"
-USER_AGENT = "tailscale-docs-live-mcp/0.1 (+https://github.com/alfranli123/tailscale-docs-live-mcp)"
+USER_AGENT = "tailscale-docs-live-mcp/0.2 (+https://github.com/alfranli123/tailscale-docs-live-mcp)"
 REQUEST_TIMEOUT = 20  # seconds
 CACHE_TTL = 600  # seconds (10 min)
+CACHE_MAX_ENTRIES = 200
+HTTP_MAX_RETRIES = 3
+HTTP_RETRY_BACKOFF = 1.0  # seconds; doubled after each retry
+HTTP_RETRY_STATUS_CODES = frozenset({429, 502, 503, 504})
 MAX_CONTENT_CHARS = 12000
 
 # ── Server instance ──────────────────────────────────────────────────────────
@@ -38,24 +45,54 @@ mcp = FastMCP(
     ),
 )
 
-# ── Simple TTL cache ─────────────────────────────────────────────────────────
+# ── Bounded TTL + LRU cache ──────────────────────────────────────────────────
 
-_cache: dict[str, tuple[float, Any]] = {}
+
+class _TTLCache:
+    """In-memory cache with TTL expiry and LRU eviction."""
+
+    def __init__(self, max_entries: int, ttl_seconds: float) -> None:
+        self._max_entries = max_entries
+        self._ttl_seconds = ttl_seconds
+        self._entries: OrderedDict[str, tuple[float, Any]] = OrderedDict()
+
+    def get(self, key: str) -> Any | None:
+        entry = self._entries.get(key)
+        if entry is None:
+            return None
+        ts, val = entry
+        if time.monotonic() - ts > self._ttl_seconds:
+            del self._entries[key]
+            return None
+        self._entries.move_to_end(key)
+        return val
+
+    def set(self, key: str, val: Any) -> None:
+        if key in self._entries:
+            del self._entries[key]
+        self._entries[key] = (time.monotonic(), val)
+        while len(self._entries) > self._max_entries:
+            self._entries.popitem(last=False)
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+
+_cache = _TTLCache(CACHE_MAX_ENTRIES, CACHE_TTL)
 
 
 def _cached(key: str) -> Any | None:
-    entry = _cache.get(key)
-    if entry is None:
-        return None
-    ts, val = entry
-    if time.monotonic() - ts > CACHE_TTL:
-        del _cache[key]
-        return None
-    return val
+    return _cache.get(key)
 
 
 def _set_cache(key: str, val: Any) -> None:
-    _cache[key] = (time.monotonic(), val)
+    _cache.set(key, val)
+
+
+async def _reset_runtime_state() -> None:
+    """Clear cache and close the HTTP client (for tests)."""
+    _cache.clear()
+    await _close_client()
 
 
 # ── Shared HTTP client (lazy‑initialised singleton, follow_redirects=True) ───
@@ -74,27 +111,74 @@ async def _get_client() -> httpx.AsyncClient:
     return _client
 
 
+def _retry_delay_seconds(response: httpx.Response | None, attempt: int) -> float:
+    if response is not None:
+        retry_after = response.headers.get("retry-after")
+        if retry_after:
+            try:
+                return max(float(retry_after), 0.0)
+            except ValueError:
+                pass
+    return HTTP_RETRY_BACKOFF * (2**attempt)
+
+
+async def _close_client() -> None:
+    global _client
+    if _client is not None:
+        await _client.aclose()
+        _client = None
+
+
+def _close_client_sync() -> None:
+    global _client
+    if _client is None:
+        return
+    client = _client
+    _client = None
+    try:
+        asyncio.run(client.aclose())
+    except RuntimeError:
+        pass
+
+
+atexit.register(_close_client_sync)
+
+
 async def _http_get(
     url: str, params: dict[str, Any] | None = None
 ) -> dict[str, Any]:
     """GET a URL, return parsed JSON or an error dict."""
     client = await _get_client()
-    try:
-        resp = await client.get(url, params=params)
-        resp.raise_for_status()
-        content_type = resp.headers.get("content-type", "")
-        if "json" in content_type:
-            return resp.json()
-        return {"_html": resp.text, "_status": resp.status_code}
-    except httpx.HTTPStatusError as exc:
-        return {
-            "error": f"HTTP {exc.response.status_code} from {url}",
-            "status": exc.response.status_code,
-        }
-    except httpx.RequestError as exc:
-        return {"error": f"Request failed: {exc}"}
-    except Exception as exc:
-        return {"error": str(exc)}
+    last_error: dict[str, Any] | None = None
+
+    for attempt in range(HTTP_MAX_RETRIES + 1):
+        try:
+            resp = await client.get(url, params=params)
+            resp.raise_for_status()
+            content_type = resp.headers.get("content-type", "")
+            if "json" in content_type:
+                return resp.json()
+            return {"_html": resp.text, "_status": resp.status_code}
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            last_error = {
+                "error": f"HTTP {status} from {url}",
+                "status": status,
+            }
+            if status in HTTP_RETRY_STATUS_CODES and attempt < HTTP_MAX_RETRIES:
+                await asyncio.sleep(_retry_delay_seconds(exc.response, attempt))
+                continue
+            return last_error
+        except httpx.RequestError as exc:
+            last_error = {"error": f"Request failed: {exc}"}
+            if attempt < HTTP_MAX_RETRIES:
+                await asyncio.sleep(_retry_delay_seconds(None, attempt))
+                continue
+            return last_error
+        except Exception as exc:
+            return {"error": str(exc)}
+
+    return last_error or {"error": f"Request failed for {url}"}
 
 
 # ── HTML → plain‑text converter (stdlib only) ────────────────────────────────
